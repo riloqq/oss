@@ -1,0 +1,234 @@
+#include <stdlib.h>
+#include <string.h>
+#include <pthread.h>
+#include <stdint.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <stdio.h>
+#include <ctype.h>
+#include <stdbool.h>
+
+typedef struct {
+    uint64_t *high; // Старшие 64 бита
+    uint64_t *low;  // Младшие 64 бита
+    size_t start;
+    size_t end;
+    uint64_t partial_sum_high;
+    uint64_t partial_sum_low;
+    size_t count;
+} ThreadData;
+
+bool hex_to_uint128(const char *hex, uint64_t *high, uint64_t *low) {
+    *high = 0;
+    *low = 0;
+
+    for (int i = 0; i < 16; i++) {
+        char c = tolower(hex[i]); 
+        uint64_t digit;
+
+        if (c >= '0' && c <= '9') {
+            digit = c - '0';
+        } else if (c >= 'a' && c <= 'f') {
+            digit = 10 + (c - 'a');
+        } else {
+            const char *error_msg = "Invalid hex character\n";
+            write(STDERR_FILENO, error_msg, strlen(error_msg));
+            return false; 
+        }
+
+        *high = (*high << 4) | digit;
+    }
+
+    for (int i = 16; i < 32; i++) {
+        char c = tolower(hex[i]);
+        uint64_t digit;
+
+        if (c >= '0' && c <= '9') {
+            digit = c - '0';
+        } else if (c >= 'a' && c <= 'f') {
+            digit = 10 + (c - 'a');
+        } else {
+            const char *error_msg = "Invalid hex character\n";
+            write(STDERR_FILENO, error_msg, strlen(error_msg));
+            return false;
+        }
+
+        *low = (*low << 4) | digit;
+    }
+
+    return true;
+}
+
+size_t read_hex_file(const char *filename, uint64_t **high, uint64_t **low) {
+    int fd = open(filename, O_RDONLY);
+    if (fd < 0) {
+        const char *error_msg = "Failed to open file\n";
+        write(STDERR_FILENO, error_msg, strlen(error_msg));
+        exit(EXIT_FAILURE);
+    }
+
+    size_t capacity = 1024;
+    *high = malloc(capacity * sizeof(uint64_t));
+    *low = malloc(capacity * sizeof(uint64_t));
+    if (*high == NULL || *low == NULL) {
+        const char *error_msg = "Memory allocation failed\n";
+        write(STDERR_FILENO, error_msg, strlen(error_msg));
+        close(fd);
+        exit(EXIT_FAILURE);
+    }
+
+    char buffer[33]; 
+    size_t count = 0;
+    ssize_t bytes_read;
+    int buffer_pos = 0;
+    char c;
+
+    while ((bytes_read = read(fd, &c, 1)) == 1) {
+        if (isspace(c)) {
+            continue;
+        }
+
+        buffer[buffer_pos++] = c;
+
+        if (buffer_pos == 32) {
+            buffer[32] = '\0'; 
+
+            uint64_t high_part, low_part;
+            if (!hex_to_uint128(buffer, &high_part, &low_part)) {
+                const char *error_msg = "Failed to parse hex number\n";
+                write(STDERR_FILENO, error_msg, strlen(error_msg));
+                free(*high);
+                free(*low);
+                close(fd);
+                exit(EXIT_FAILURE);
+            }
+
+            (*high)[count] = high_part;
+            (*low)[count] = low_part;
+
+            // Вывод числа для отладки
+            char debug_msg[100];
+            int len = snprintf(debug_msg, sizeof(debug_msg), "Read number %zu: 0x%016lx%016lx\n", count, high_part, low_part);
+            write(STDOUT_FILENO, debug_msg, len);
+
+            count++;
+
+            if (count >= capacity) {
+                capacity *= 2;
+                *high = realloc(*high, capacity * sizeof(uint64_t));
+                *low = realloc(*low, capacity * sizeof(uint64_t));
+                if (*high == NULL || *low == NULL) {
+                    const char *error_msg = "Memory reallocation failed\n";
+                    write(STDERR_FILENO, error_msg, strlen(error_msg));
+                    close(fd);
+                    exit(EXIT_FAILURE);
+                }
+            }
+            
+            buffer_pos = 0;
+        }
+    }
+
+    if (bytes_read < 0) {
+        const char *error_msg = "Failed to read file\n";
+        write(STDERR_FILENO, error_msg, strlen(error_msg));
+        free(*high);
+        free(*low);
+        close(fd);
+        exit(EXIT_FAILURE);
+    }
+
+    close(fd);
+    return count;
+}
+
+// Функция для вычисления частичной суммы в потоке
+void *thread_sum(void *arg) {
+    ThreadData *thread_data = (ThreadData *)arg;
+    thread_data->partial_sum_high = 0;
+    thread_data->partial_sum_low = 0;
+
+    for (size_t i = thread_data->start; i < thread_data->end; i++) {
+        thread_data->partial_sum_high += thread_data->high[i];
+        thread_data->partial_sum_low += thread_data->low[i];
+    }
+
+    return NULL;
+}
+
+// Функция для вывода 128-битного числа
+void write_uint128(uint64_t high, uint64_t low) {
+    char buffer[100];
+    int len = snprintf(buffer, sizeof(buffer), "0x%016lx%016lx\n", high, low);
+    write(STDOUT_FILENO, buffer, len);
+}
+
+int main(int argc, char **argv) {
+    if (argc != 4) {
+        const char *usage_msg = "Usage: <file> <max_threads> <max_memory_MB>\n";
+        write(STDERR_FILENO, usage_msg, strlen(usage_msg));
+        return EXIT_FAILURE;
+    }
+
+    const char *filename = argv[1];
+    int max_threads = atoi(argv[2]);
+    size_t max_memory = (size_t)atoi(argv[3]) * 1024 * 1024; // Переводим МБ в байты
+
+    if (max_threads <= 0 || max_memory == 0) {
+        const char *error_msg = "Invalid arguments\n";
+        write(STDERR_FILENO, error_msg, strlen(error_msg));
+        return EXIT_FAILURE;
+    }
+
+    uint64_t *high = NULL;
+    uint64_t *low = NULL;
+    size_t count = read_hex_file(filename, &high, &low);
+
+    if (count == 0) {
+        const char *error_msg = "No numbers found in the file\n";
+        write(STDERR_FILENO, error_msg, strlen(error_msg));
+        free(high);
+        free(low);
+        return EXIT_FAILURE;
+    }
+
+    // Разделение данных между потоками
+    pthread_t threads[max_threads];
+    ThreadData thread_data[max_threads];
+    size_t chunk_size = count / max_threads;
+
+    for (int i = 0; i < max_threads; i++) {
+        thread_data[i].high = high;
+        thread_data[i].low = low;
+        thread_data[i].start = i * chunk_size;
+        thread_data[i].end = (i == max_threads - 1) ? count : (i + 1) * chunk_size;
+        thread_data[i].count = count;
+        pthread_create(&threads[i], NULL, thread_sum, &thread_data[i]);
+    }
+
+    // Ожидание завершения потоков
+    for (int i = 0; i < max_threads; i++) {
+        pthread_join(threads[i], NULL);
+    }
+
+    // Суммирование частичных сумм
+    uint64_t total_sum_high = 0;
+    uint64_t total_sum_low = 0;
+    for (int i = 0; i < max_threads; i++) {
+        total_sum_high += thread_data[i].partial_sum_high;
+        total_sum_low += thread_data[i].partial_sum_low;
+    }
+
+    // Вычисление среднего
+    uint64_t average_high = total_sum_high / count;
+    uint64_t average_low = total_sum_low / count;
+
+    // Вывод результата
+    const char *result_msg = "Average: ";
+    write(STDOUT_FILENO, result_msg, strlen(result_msg));
+    write_uint128(average_high, average_low);
+
+    free(high);
+    free(low);
+    return EXIT_SUCCESS;
+}
